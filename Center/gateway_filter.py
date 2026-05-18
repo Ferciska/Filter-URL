@@ -1,9 +1,13 @@
 import joblib
 import numpy as np
 import re
+import os
+from urllib.parse import urlparse
 from mitmproxy import http
 
-# 1. ЗАГРУЗКА МОЗГОВ СИСТЕМЫ
+# =====================================================================
+# 1. ЗАГРУЗКА МОЗГОВ СИСТЕМЫ И НАСТРОЙКИ ОБХОДА
+# =====================================================================
 try:
     model = joblib.load('micro_net.pkl')
     scaler = joblib.load('scaler.pkl')
@@ -13,6 +17,24 @@ except FileNotFoundError:
     print("❌ [AI GATEWAY] Ошибка: Не найдены файлы модели в текущей папке!")
     exit()
 
+# Глобальный белый список доменов (чтобы не ломать системный софт и доверенные ресурсы)
+WHITELIST_DOMAINS = {
+    "google.com", "googleapis.com", "gstatic.com", "googleads.g.doubleclick.net", "googlevideo.com", "youtube.com",
+    "yandex.kz", "yandex.net", "ya.ru", "yastatic.net",
+    "microsoft.com", "windows.com", "azurefd.net", "bing.com", "msn.com", "live.com", "office.com", "msedge.net",
+    "github.com", "jsdelivr.net", "kaspersky.com"
+}
+
+# Безопасные расширения (статические файлы не могут быть фишинговыми веб-страницами)
+SAFE_EXTENSIONS = {
+    '.png', '.jpg', '.jpeg', '.gif', '.ico', '.svg', 
+    '.css', '.js', '.woff', '.woff2', '.ttf', '.mp4', '.webm'
+}
+
+
+# =====================================================================
+# 2. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ И СКОРИНГ
+# =====================================================================
 def extract_advanced_features(url):
     """Экстрактор фич (8 активных + маска средних значений)"""
     features = dataset_means.copy()
@@ -31,26 +53,52 @@ def extract_advanced_features(url):
     features[104] = 1 if url.startswith("https") else 0
     return features
 
-# 2. ПЕРЕХВАТ ТРАФИКА
+
+def is_whitelisted(url, domain):
+    """Проверка: находится ли ресурс в списке исключений"""
+    # 1. Проверка по жестким ключевым словам (твоя старая логика)
+    if "update" in url or "windowsupdate" in url or "msedge" in url:
+        return True
+
+    # 2. Проверка по базе доверенных доменов и их поддоменов
+    for trusted_domain in WHITELIST_DOMAINS:
+        if domain == trusted_domain or domain.endswith("." + trusted_domain):
+            return True
+
+    # 3. Проверка на безопасный статический контент (картинки, шрифты, стили)
+    try:
+        path = urlparse(url).path.lower()
+        if any(path.endswith(ext) for ext in SAFE_EXTENSIONS):
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+# =====================================================================
+# 3. ПЕРЕХВАТ ТРАФИКА (ОСНОВНОЙ ЦИКЛ MITMPROXY)
+# =====================================================================
 def request(flow: http.HTTPFlow) -> None:
     url = flow.request.pretty_url
     
-    # Игнорируем фоновые системные запросы Windows / Обновлений, чтобы не спамить в консоль
-    if "update" in url or "windowsupdate" in url or "msedge" in url:
-        return
-
-    # Вытаскиваем чистый домен для эвристики
+    # Вытаскиваем чистый домен для эвристики и проверок
     clean_url = url.replace("http://", "").replace("https://", "").replace("www.", "")
-    domain = clean_url.split('/')[0].split(':')[0]
+    domain = clean_url.split('/')[0].split(':')[0].lower()
 
-    # --- ЭТАП 1: ЭВРИСТИЧЕСКИЙ ФИЛЬТР ---
+    # --- ЭТАП 1: ЭВРИСТИЧЕСКИЙ ФИЛЬТР (Сырые IP) ---
     if re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", domain):
-        # Если это внешний сырой IP - рубим сразу без нейросети
+        # Если это внешний сырой IP - рубим сразу, минуя ИИ
         if not domain.startswith("192.168.") and not domain.startswith("10.") and not domain.startswith("127."):
             block_request(flow, url, method="Эвристика (Сырой IP)", prob=100.0)
             return
 
-    # --- ЭТАП 2: НЕЙРОСЕТЕВОЙ АНАЛИЗ ---
+    # --- ЭТАП 2: ФИЛЬТР ИСКЛЮЧЕНИЙ (Белый список) ---
+    if is_whitelisted(url, domain):
+        # Пропускаем без спама в консоль и без дерганья ML-модели
+        return
+
+# --- ЭТАП 3: НЕЙРОСЕТЕВОЙ АНАЛИЗ ---
     raw_features = extract_advanced_features(url)
     features_reshaped = raw_features.reshape(1, -1)
     features_scaled = scaler.transform(features_reshaped)
@@ -58,18 +106,24 @@ def request(flow: http.HTTPFlow) -> None:
     # Считаем вероятность фишинга
     probability = model.predict_proba(features_scaled)[0][1] * 100
 
-    # Если вероятность выше 50% — это угроза
-    if probability >= 50.0:
+    # НАСТРОЙКА УРОВНЕЙ РЕАГИРОВАНИЯ (Максимальная защита: бан от 55%)
+    # >= 55.0% -> Жесткая блокировка
+    # от 40.0% до 55.0% -> Подозрительно (Пропускаем, но логируем)
+    if probability >= 55.0:
         block_request(flow, url, method="Нейросеть (ML-Детект)", prob=probability)
+    elif probability >= 40.0:
+        print(f"🟡 [ПОДОЗРИТЕЛЬНО] {url[:60]}... | Угроза: {probability:.2f}% (Пропущено)")
     else:
         print(f"🟢 [ПРОПУЩЕН] {url[:60]}... | Угроза: {probability:.2f}%")
 
 
+# =====================================================================
+# 4. ГЕНЕРАЦИЯ СТРАНИЦЫ БЛОКИРОВКИ
+# =====================================================================
 def block_request(flow, url, method, prob):
     """Функция генерации страницы блокировки для нарушителя"""
-    print(f"🛑 [БЛОКИРОВКА] [{method}] Ссылка: {url} | Степень угрозы: {prob:.2f}%")
+    print(f"🛑 [БЛОКИРОВКА] [{method}] Ссылка: {url[:70]}... | Степень угрозы: {prob:.2f}%")
     
-    # Формируем красивый HTML-ответ, который увидит пользователь вместо сайта
     html_content = f"""
     <!DOCTYPE html>
     <html lang="ru">
@@ -97,7 +151,6 @@ def block_request(flow, url, method, prob):
     </html>
     """
     
-    # Подменяем ответ сервера на наш HTML с кодом 403 (Forbidden)
     flow.response = http.Response.make(
         403, 
         html_content.encode('utf-8'), 
