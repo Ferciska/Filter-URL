@@ -1,115 +1,105 @@
 import joblib
 import numpy as np
-from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-import requests
+import re
+from mitmproxy import http
 
-# 1. Загружаем твой продвинутый мозг и скалер
+# 1. ЗАГРУЗКА МОЗГОВ СИСТЕМЫ
 try:
     model = joblib.load('micro_net.pkl')
     scaler = joblib.load('scaler.pkl')
-    print("🧠 Нейросеть успешно подключена к шлюзу трафика!")
+    dataset_means = joblib.load('dataset_means.pkl')
+    print("🚀 [AI GATEWAY] Модель машинного обучения успешно внедрена в прокси!")
 except FileNotFoundError:
-    print("❌ Ошибка: Файлы 'micro_net.pkl' или 'scaler.pkl' не найдены в этой папке!")
+    print("❌ [AI GATEWAY] Ошибка: Не найдены файлы модели в текущей папке!")
     exit()
 
-# IP-адрес главного компьютера в локальной сети, где запущена заглушка stub.py
-STUB_SERVER_URL = "http://127.0.0.1:8080" 
-
-# БЕЛЫЙ СПИСОК: Системные домены, фоновый спам от которых мы НЕ выводим в консоль
-# БЕЛЫЙ СПИСОК: Сюда добавляем всё, что генерирует фоновый шум (Android, Windows, iOS)
-SYSTEM_WHITELIST = [
-    "connectivitycheck.gstatic.com",  # Google / Android
-    "play.googleapis.com",            # Google Play
-    "www.google.com/gen_204",         # Google фоновый тест
-    "generate_204",                   # Общий паттерн для Android
-    "msftconnecttest.com",            # Windows тест сети (IPv4 и IPv6)
-    "msftncsi.com"                    # Старый тип проверки Windows NCSI
-]
-
-def check_url_with_ai(url):
-    """ Наша продвинутая функция извлечения текстовых фич """
-    features = np.zeros(111)
+def extract_advanced_features(url):
+    """Экстрактор фич (8 активных + маска средних значений)"""
+    features = dataset_means.copy()
     clean_url = url.replace("http://", "").replace("https://", "").replace("www.", "")
-    
-    features[0] = len(url)
-    features[1] = url.count('.')
-    features[2] = url.count('-')
-    features[3] = url.count('/')
-    
-    domain = clean_url.split('/')[0]
-    features[18] = len(domain)
-    features[19] = domain.count('.')
-    features[20] = domain.count('-')
-    
-    if url.startswith("https"):
-        features[104] = 1
+    domain = clean_url.split('/')[0].split(':')[0] 
         
-    features_reshaped = features.reshape(1, -1)
+    features[0] = len(url)                    # length_url
+    features[1] = url.count('.')              # qty_dot_url
+    features[2] = url.count('-')              # qty_hyphen_url
+    features[3] = url.count('/')              # qty_slash_url
+    
+    features[18] = len(domain)                # domain_length
+    features[19] = domain.count('.')          # qty_dot_domain
+    features[20] = domain.count('-')          # qty_hyphen_domain
+    
+    features[104] = 1 if url.startswith("https") else 0
+    return features
+
+# 2. ПЕРЕХВАТ ТРАФИКА
+def request(flow: http.HTTPFlow) -> None:
+    url = flow.request.pretty_url
+    
+    # Игнорируем фоновые системные запросы Windows / Обновлений, чтобы не спамить в консоль
+    if "update" in url or "windowsupdate" in url or "msedge" in url:
+        return
+
+    # Вытаскиваем чистый домен для эвристики
+    clean_url = url.replace("http://", "").replace("https://", "").replace("www.", "")
+    domain = clean_url.split('/')[0].split(':')[0]
+
+    # --- ЭТАП 1: ЭВРИСТИЧЕСКИЙ ФИЛЬТР ---
+    if re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", domain):
+        # Если это внешний сырой IP - рубим сразу без нейросети
+        if not domain.startswith("192.168.") and not domain.startswith("10.") and not domain.startswith("127."):
+            block_request(flow, url, method="Эвристика (Сырой IP)", prob=100.0)
+            return
+
+    # --- ЭТАП 2: НЕЙРОСЕТЕВОЙ АНАЛИЗ ---
+    raw_features = extract_advanced_features(url)
+    features_reshaped = raw_features.reshape(1, -1)
     features_scaled = scaler.transform(features_reshaped)
     
-    prediction = model.predict(features_scaled)[0]
+    # Считаем вероятность фишинга
     probability = model.predict_proba(features_scaled)[0][1] * 100
-    return prediction, probability
+
+    # Если вероятность выше 50% — это угроза
+    if probability >= 50.0:
+        block_request(flow, url, method="Нейросеть (ML-Детект)", prob=probability)
+    else:
+        print(f"🟢 [ПРОПУЩЕН] {url[:60]}... | Угроза: {probability:.2f}%")
 
 
-class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
-    """ Обработчик прокси-запросов, проходящих через главный комп """
+def block_request(flow, url, method, prob):
+    """Функция генерации страницы блокировки для нарушителя"""
+    print(f"🛑 [БЛОКИРОВКА] [{method}] Ссылка: {url} | Степень угрозы: {prob:.2f}%")
     
-    def log_message(self, format, *args):
-        """ 🔇 ПЕРЕОПРЕДЕЛЕНИЕ: Полностью глушим стандартный текстовый спам Python в консоли """
-        pass
-
-    def do_GET(self):
-        url = self.path
-        
-        # 1. Игнорируем запросы к нашей же заглушке, чтобы не зациклиться
-        if "8080" in url or "127.0.0.1" in url:
-            self.proxy_forward(url)
-            return
-
-        # 2. Проверяем, есть ли URL в белом списке системного трафика
-        if any(domain in url for domain in SYSTEM_WHITELIST):
-            # Пропускаем его абсолютно молча, не нагружая консоль и нейросеть
-            self.proxy_forward(url)
-            return
-
-        # 3. А вот оригинальные запросы пользователя выводим и анализируем!
-        print(f"🔍 Шлюз перехватил запрос: {url}")
-        
-        # Проверяем нейросетью
-        is_phishing, prob = check_url_with_ai(url)
-        
-        if is_phishing == 1 and prob > 75.0: # Порог срабатывания 75%
-            print(f"🛑 КРИТИЧЕСКИЙ СИГНАЛ: Фишинг обнаружен ({prob:.2f}%)! Блокируем: {url}")
-            # Перенаправляем на страницу-затычку
-            self.send_response(302)
-            self.send_header('Location', STUB_SERVER_URL)
-            self.end_headers()
-        else:
-            print(f"🟢 Ссылка чистая ({prob:.2f}% угрозы). Пропускаем.")
-            self.proxy_forward(url)
-
-    def proxy_forward(self, url):
-        """ Пересылка легитимного запроса дальше в интернет """
-        try:
-            headers = {key: self.headers[key] for key in self.headers}
-            response = requests.get(url, headers=headers, stream=True, timeout=5)
-            
-            self.send_response(response.status_code)
-            for key, value in response.headers.items():
-                if key.lower() not in ['transfer-encoding', 'content-encoding']:
-                    self.send_header(key, value)
-            self.end_headers()
-            
-            self.wfile.write(response.content)
-        except Exception as e:
-            self.send_error(502, f"Proxy error: {e}")
-
-if __name__ == "__main__":
-    server = ThreadingHTTPServer(('0.0.0.0', 8888), ProxyHTTPRequestHandler)
-    print("🚀 Центральный ИИ-фильтр трафика запущен на порту 8888...")
-    print("Ожидаю трафик со всей сети через DHCP шлюз...")
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\nШлюз остановлен.")
+    # Формируем красивый HTML-ответ, который увидит пользователь вместо сайта
+    html_content = f"""
+    <!DOCTYPE html>
+    <html lang="ru">
+    <head>
+        <meta charset="UTF-8">
+        <title>Система безопасности школы</title>
+        <style>
+            body {{ background-color: #1a1a1a; color: #ffffff; font-family: 'Segoe UI', sans-serif; text-align: center; padding-top: 10%; }}
+            .card {{ background: #2d2d2d; border-radius: 8px; padding: 40px; display: inline-block; box-shadow: 0 4px 15px rgba(0,0,0,0.5); max-width: 600px; }}
+            h1 {{ color: #ff4d4d; font-size: 48px; margin-bottom: 10px; }}
+            .url-box {{ background: #111; padding: 15px; border-radius: 4px; font-family: monospace; word-break: break-all; color: #ff9999; margin: 20px 0; }}
+            .info {{ color: #aaaaaa; font-size: 14px; }}
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <h1>ДОСТУП ОГРАНИЧЕН</h1>
+            <p>Внимание! Наша гибридная ИИ-система безопасности заблокировала переход.</p>
+            <div class="url-box">{url}</div>
+            <p><strong>Метод обнаружения:</strong> {method}<br>
+            <strong>Вероятность фишинга:</strong> {prob:.2f}%</p>
+            <p class="info">Запрос заблокирован на уровне интернет-шлюза школы.</p>
+        </div>
+    </body>
+    </html>
+    """
+    
+    # Подменяем ответ сервера на наш HTML с кодом 403 (Forbidden)
+    flow.response = http.Response.make(
+        403, 
+        html_content.encode('utf-8'), 
+        {"Content-Type": "text/html; charset=utf-8"}
+    )
